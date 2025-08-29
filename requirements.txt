@@ -1,0 +1,8 @@
+fastapi[standard]
+openai-whisper
+py-trello
+transformers
+nltk
+keybert
+networkx
+pytubefix
