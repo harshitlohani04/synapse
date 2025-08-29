@@ -1,7 +1,5 @@
 import os
 import requests
-import nltk
-import numpy as np
 import networkx as nx
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize, word_tokenize
@@ -11,6 +9,7 @@ from keybert import KeyBERT
 from dotenv import load_dotenv
 from transformers import pipeline
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed # for main prototyping will later shift to asyncio for better efficiency
 
 # nlp processing class
 class KeywordAndSentencesExtractor:
@@ -85,7 +84,21 @@ class TrelloIntegration:
             self.board_response = {"status_code": 400, "message": e}
             print(f"error encountered in board creation : {e}")
 
-    def _create_list(self, keywords: list):
+    def list_processing(list_id: str, cards: list):
+        url = "https://api.trello.com/1/cards"
+        headers = {
+          "Accept": "application/json"
+        }
+        for card_name in cards:
+            query = {
+              'idList': list_id,
+              "name": card_name,
+              'key': 'APIKey',
+              'token': 'APIToken'
+            }
+            requests.post(url, headers, params=query)    
+
+    def _add_cards_to_list(self, keywords: list):
         # list name can also be figured out from the video transcription in some way but in later versions
         board_id = self.board_response["id"]
         url = self.url + f"{board_id}/lists"
@@ -98,6 +111,7 @@ class TrelloIntegration:
         }
         list_response = requests.get(url=url, headers=headers, params=query)
         board_lists = list_response.text
+        list_id_map = {list["name"]: list["id"] for list in board_lists} # list name mapping to the id
         list_names = [lists["name"] for lists in board_lists]
         print(list_names)
 
@@ -115,6 +129,19 @@ class TrelloIntegration:
             except Exception as e:
                 print(f"error in list classification : {e}")
                 return None
+            
+        # fetch the lists and add the cards to the respective list
+        listKeyMap = keyword_classifier()
+        # {"todo": ["card1", "card2"]} --> desired output from the function
+        
+        try: # threading for adding the cards to the lists simultaneously
+            for list_name, list_id in list_id_map:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = [executor.submit(self.list_processing, list_id, listKeyMap[list_name])]
+            print("Adding cards to the lists successful")
+        except Exception as e:
+            print(f"Error occured in adding the cards to the lists! : {e}")
+
 
 load_dotenv()
 def testing_function():
