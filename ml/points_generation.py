@@ -1,6 +1,7 @@
 import os
 import requests
 import networkx as nx
+import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize, word_tokenize
 from sklearn.metrics.pairwise import cosine_similarity
@@ -35,7 +36,7 @@ class KeywordAndSentencesExtractor:
         sim_mat = vectorizer.fit_transform(sentences)
         return cosine_similarity(sim_mat)
     
-    def text_rank_extraction(self, top_k: int = 5):
+    def text_extraction(self, top_k: int = 5):
         original, cleaned = self.preprocess_transcription()
         if len(original)<top_k:
             return " ".join(original)
@@ -60,14 +61,21 @@ class KeywordAndSentencesExtractor:
 class TrelloIntegration:
     def __init__(self, name, desc, token, api_key, create_default_lists: bool = True): # board desc to be added
         super().__init__()
+        # keyword extraction model
+        self.zero_shot_classifier = pipeline("zero-shot-classification")
         # defining the connection creation variables
         self.token = token
         self.api_key = api_key
+        if not self.api_key or not self.token:
+            print("🔴 ERROR: TRELLO_KEY or TRELLO_TOKEN not found in environment.")
+            print("🔴 Halting application.")
         self.url = "https://api.trello.com/1/boards/"
+        self.boardURL = ""
         # Establish connection with trello
         query = {
-            "name": f"{name}",
+            "name": name,
             "key": self.api_key,
+            "desc": desc,
             "token": self.token,
             "defaultLists": "true" if create_default_lists else "false"
         }
@@ -78,13 +86,20 @@ class TrelloIntegration:
                 params=query,
             )
             response.raise_for_status() # error if board creation failed
-            self.board_response = response.text
-            print(response.content)
+            self.board_response = response.json()
+            print(response.json())
+            self.boardURL = response.json().get("url") # fetching the board url
+            print(response.text)
         except requests.exceptions.HTTPError as e:
             self.board_response = {"status_code": 400, "message": e}
             print(f"error encountered in board creation : {e}")
 
-    def list_processing(list_id: str, cards: list):
+    @property
+    def _get_board_url(self):
+        # simply returns the url of the created board
+        return self.boardURL
+
+    def list_processing(self, list_id: str, cards: list):
         url = "https://api.trello.com/1/cards"
         headers = {
           "Accept": "application/json"
@@ -93,14 +108,14 @@ class TrelloIntegration:
             query = {
               'idList': list_id,
               "name": card_name,
-              'key': 'APIKey',
-              'token': 'APIToken'
+              'key': self.api_key,
+              'token': self.token
             }
-            requests.post(url, headers, params=query)    
+            requests.post(url, params=query, headers=headers)  
 
     def _add_cards_to_list(self, keywords: list):
         # list name can also be figured out from the video transcription in some way but in later versions
-        board_id = self.board_response["id"]
+        board_id = self.board_response.get("id")
         url = self.url + f"{board_id}/lists"
         headers = {
             "Accept": "application/json"
@@ -110,22 +125,21 @@ class TrelloIntegration:
             "token": self.token
         }
         list_response = requests.get(url=url, headers=headers, params=query)
-        board_lists = list_response.text
-        list_id_map = {list["name"]: list["id"] for list in board_lists} # list name mapping to the id
-        list_names = [lists["name"] for lists in board_lists]
+        board_lists = list_response.json()
+        list_id_map = {l.get("name"): l.get("id") for l in board_lists} # list name mapping to the id
+        list_names = [lists.get("name") for lists in board_lists]
         print(list_names)
 
         def keyword_classifier(): # zero-shot classification for the keywords
             # no need for initializing as non-local as only read operation is performed
             list_key_mapping = defaultdict(list)
             try:
-                zero_shot_classifier = pipeline("zero-shot-classification")
                 for key in keywords:
-                    label = zero_shot_classifier(key, list_names)
+                    label = self.zero_shot_classifier(key, list_names)
                     list_key_mapping[label["labels"][0]].append(key)
                     # print(f"keyword {key} likely belongs to the {label["labels"][0]} class")
 
-                    return list_key_mapping
+                return list_key_mapping
             except Exception as e:
                 print(f"error in list classification : {e}")
                 return None
@@ -135,7 +149,7 @@ class TrelloIntegration:
         # {"todo": ["card1", "card2"]} --> desired output from the function
         
         try: # threading for adding the cards to the lists simultaneously
-            for list_name, list_id in list_id_map:
+            for list_name, list_id in list_id_map.items():
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     futures = [executor.submit(self.list_processing, list_id, listKeyMap[list_name])]
             print("Adding cards to the lists successful")
@@ -143,14 +157,15 @@ class TrelloIntegration:
             print(f"Error occured in adding the cards to the lists! : {e}")
 
 
-load_dotenv()
-def testing_function():
-    trello_key = os.getenv("TRELLO_KEY")
-    trello_token = os.getenv("TRELLO_TOKEN")
+# load_dotenv()
+# # only for testing the functioning of the classes
+# def testing_function():
+#     trello_key = os.getenv("TRELLO_KEY")
+#     trello_token = os.getenv("TRELLO_TOKEN")
 
-    # creating connection
-    trello_instance = TrelloIntegration("sample board", " ", trello_token, trello_key)
+#     # creating connection
+#     trello_instance = TrelloIntegration("sample board", " ", trello_token, trello_key)
 
-if __name__ == "__main__":
-    testing_function()
+# if __name__ == "__main__":
+#     testing_function()
 
