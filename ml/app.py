@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 import requests
 import boto3
 from pytubefix import YouTube
-from points_generation import fetch_important_points_from_transcription
+from points_generation import KeywordAndSentencesExtractor, TrelloIntegration
 import whisper
 
 # creating s3 client
@@ -56,24 +56,35 @@ def process_audio(audio_path: str):
         result = model_w.transcribe(audio=audio_path)
         return result["text"]
     except Exception as e:
-        print(f"Fucked up again : {e}")
+        print(f"Fucked up again : {e}") # Correct this line of code
         return None
 
 web_app = FastAPI()
 
+# env variables fetching
+load_dotenv()
+trello_key = os.getenv("TRELLO_KEY")
+trello_token = os.getenv("TRELLO_TOKEN")
+
 # temporary endpoint for prototyping
-# will seperate the endpoints for upload and processing
+# to be separated later for upload and processing
 @web_app.post("/upload-video", response_class=JSONResponse)
 async def upload_video(request: Request):
     data = await request.json()
     video_link = data.get("video-link")
+    boardName = data.get('board-name')
     print(video_link)
     audio_path = download_video(video_link)
     print(f"{audio_path}")
     transcriptions = process_audio(audio_path)
-    # impPoints = fetch_important_points_from_transcription(transcriptions)
-    # if audio_path:
-    #     file_upload(impPoints, video_link)
+    # NLP class initialization
+    extractor = KeywordAndSentencesExtractor(transcriptions)
+    desc = extractor.text_extraction()
+    keywords = extractor.keyword_extraction()
+    # trello class init
+    trello = TrelloIntegration(name=boardName, desc=desc, token=trello_token, api_key=trello_key)
+    trello._add_cards_to_list(keywords)
+    board_url = trello._get_board_url
 
-    return JSONResponse(content={"transcription": transcriptions}, status_code=200)
+    return JSONResponse(content={"url for the board": board_url}, status_code=200)
 
