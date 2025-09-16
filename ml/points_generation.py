@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 from transformers import pipeline
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed # for main prototyping will later shift to asyncio for better efficiency
+import asyncio
+import aiohttp
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
 
 # nlp processing class
 class KeywordAndSentencesExtractor:
@@ -53,22 +57,26 @@ class KeywordAndSentencesExtractor:
         kw_model = KeyBERT()
         keywords = kw_model.extract_keywords(self.transcription, 
                                              keyphrase_ngram_range=(1, 3), # Allow up to 3-word phrases
-                                             stop_words='english', 
+                                             stop_words='english',
+                                             use_mmr=True, # using the maximal marginal relevance for better extraction
+                                             diversity=0.7,
                                              top_n=top_n)
         return [kw for kw, _ in keywords]
 
 # trello integration class
 class TrelloIntegration:
-    def __init__(self, name, desc, token, api_key, create_default_lists: bool = True): # board desc to be added
+    def __init__(self, name, desc, token, api_key, default_lists: bool = True, n: int=None): # board desc to be added
         super().__init__()
         # keyword extraction model
         self.zero_shot_classifier = pipeline("zero-shot-classification")
         # defining the connection creation variables
         self.token = token
         self.api_key = api_key
+        self.n = n
+        self.default_lists = default_lists
+        self.board_desc = desc
         if not self.api_key or not self.token:
             print("🔴 ERROR: TRELLO_KEY or TRELLO_TOKEN not found in environment.")
-            print("🔴 Halting application.")
         self.url = "https://api.trello.com/1/boards/"
         self.boardURL = ""
         # Establish connection with trello
@@ -77,7 +85,7 @@ class TrelloIntegration:
             "key": self.api_key,
             "desc": desc,
             "token": self.token,
-            "defaultLists": "true" if create_default_lists else "false"
+            "defaultLists": "true" if default_lists else "false"
         }
         try:
             # ------------ checking for already existing board by the same name pending ------------- #
@@ -85,37 +93,81 @@ class TrelloIntegration:
                 url=self.url,
                 params=query,
             )
+            if response.status_code!=200:
+                print(f"following is the error message from trello : {response.text}")
             response.raise_for_status() # error if board creation failed
             self.board_response = response.json()
             print(response.json())
-            self.boardURL = response.json().get("url") # fetching the board url
+            self.boardURL = self.board_response.get("url") # fetching the board url
             print(response.text)
         except requests.exceptions.HTTPError as e:
             self.board_response = {"status_code": 400, "message": e}
             print(f"error encountered in board creation : {e}")
+
+    async def generate_list_names(summary: str, n: int = 3): # function to generate "n" lists for the users
+        llm = ChatOpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1",
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+            max_tokens=128
+        )
+        promptTemplate = ChatPromptTemplate([
+            ("system", "You are a Trello workflow automation agent and you are to produce {n} list names for a particular summary."),
+            ("user", "Given this context {context} you are to generate the names for the lists that can be created on the trello board for the user, basically dividing the entire task into the required number of list names. Output only the list of the list names and no explanation for the same")
+        ])
+
+        promptTemplate.invoke({"n": n, "context": summary})
+        try:
+            response = await llm.invoke(promptTemplate)
+        except Exception:
+            return None
+        return response.content
 
     @property
     def _get_board_url(self):
         # simply returns the url of the created board
         return self.boardURL
 
-    def list_processing(self, list_id: str, cards: list):
+    async def list_processing(self, list_id: str, card: list):
         url = "https://api.trello.com/1/cards"
         headers = {
           "Accept": "application/json"
         }
-        for card_name in cards:
-            query = {
-              'idList': list_id,
-              "name": card_name,
-              'key': self.api_key,
-              'token': self.token
-            }
-            requests.post(url, params=query, headers=headers)  
+        query = {
+                  'idList': list_id,
+                  "name": card,
+                  'key': self.api_key,
+                  'token': self.token
+                }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=query, headers=headers) as response:
+                response.raise_for_status()
 
-    def _add_cards_to_list(self, keywords: list):
-        # list name can also be figured out from the video transcription in some way but in later versions
+    async def _add_cards_to_list(self, keywords: list):
         board_id = self.board_response.get("id")
+
+        # if the user selects the option for custom lists
+        if self.n and not self.default_lists:
+            # Creating the lists in the board
+            url_list = "https://api.trello.com/1/lists"
+            names = await self.generate_list_names(self.board_desc, self.n) # supposed to be in the list format
+            query = {
+                "name": '{name}',
+                "idBoard": board_id,
+                "key": self.api_key,
+                "token": self.token
+            }
+            async def add_lists(session, name):
+                payload = query["name"].format(name=name)
+                query["name"] = payload
+                async with session.get(url = url_list, params=query) as response:
+                    response.raise_for_status()
+                    return response.text
+            async with aiohttp.ClientSession() as session:
+                list_processing_coroutines = [add_lists(session, names[i]) for i in range(len(names))]
+                _ = await asyncio.gather(*list_processing_coroutines) # text messages from the list creation request
+
         url = self.url + f"{board_id}/lists"
         headers = {
             "Accept": "application/json"
@@ -130,42 +182,58 @@ class TrelloIntegration:
         list_names = [lists.get("name") for lists in board_lists]
         print(list_names)
 
-        def keyword_classifier(): # zero-shot classification for the keywords
-            # no need for initializing as non-local as only read operation is performed
+        async def keyword_classifier(): # zero-shot classification for the keywords
+
+            '''
+            Code segment for improving the keywords of the keybert model using langchain
+            '''
+            prompt_template_key = ChatPromptTemplate([
+                ("system", "You are a trello card creator and you are to improve the currently existing card text."),
+                ('user', 'Given this context {context} and these cards values : {cards} you are to improve the current card values such that the card values are more contextually correct and to the point that are able to explain the particular task that they are meant to explain.\
+                 The output should be in a strict list format and no other information should be there along with it.')
+            ])
+
+            model = ChatOpenAI(
+                api_key=os.getenv("GROQ_API_KEY"),
+                base_url="https://api.groq.com/openai/v1",
+                model="llama-3.3-70b-versatile",
+                temperature=0.1,
+                max_tokens=128
+            )
+            try:
+                list_names = await model.invoke(prompt_template_key)
+            except Exception:
+                list_names = None
+            '''
+            classification using the zero shot learning model.
+            '''
             list_key_mapping = defaultdict(list)
             try:
-                for key in keywords:
-                    label = self.zero_shot_classifier(key, list_names)
-                    list_key_mapping[label["labels"][0]].append(key)
-                    # print(f"keyword {key} likely belongs to the {label["labels"][0]} class")
-
+                if list_names:
+                    for key in keywords:
+                        label = self.zero_shot_classifier(key, list_names)
+                        list_key_mapping[label["labels"][0]].append(key)
                 return list_key_mapping
             except Exception as e:
                 print(f"error in list classification : {e}")
                 return None
             
         # fetch the lists and add the cards to the respective list
-        listKeyMap = keyword_classifier()
+        listKeyMap = await keyword_classifier()
         # {"todo": ["card1", "card2"]} --> desired output from the function
         
         try: # threading for adding the cards to the lists simultaneously
+
+            # Can be made more efficient as per gemini
+            # right now the entire thread pool is destroyed and made again for different iterations -> inefficient
+            # every processing can be done by creating a seperate thread for all -> more efficient
+            # most efficient -> asyncio
+            tasks = []
             for list_name, list_id in list_id_map.items():
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    futures = [executor.submit(self.list_processing, list_id, listKeyMap[list_name])]
+                for card in listKeyMap[list_name]:
+                    tasks.append(self.list_processing(list_id, card))
+                _ = asyncio.gather(*tasks)
             print("Adding cards to the lists successful")
         except Exception as e:
             print(f"Error occured in adding the cards to the lists! : {e}")
-
-
-# load_dotenv()
-# # only for testing the functioning of the classes
-# def testing_function():
-#     trello_key = os.getenv("TRELLO_KEY")
-#     trello_token = os.getenv("TRELLO_TOKEN")
-
-#     # creating connection
-#     trello_instance = TrelloIntegration("sample board", " ", trello_token, trello_key)
-
-# if __name__ == "__main__":
-#     testing_function()
 
