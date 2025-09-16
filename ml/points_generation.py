@@ -10,7 +10,6 @@ from keybert import KeyBERT
 from dotenv import load_dotenv
 from transformers import pipeline
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed # for main prototyping will later shift to asyncio for better efficiency
 import asyncio
 import aiohttp
 from langchain_openai import ChatOpenAI
@@ -65,6 +64,9 @@ class KeywordAndSentencesExtractor:
 
 # trello integration class
 class TrelloIntegration:
+    load_dotenv()
+    groq_key = os.getenv("GROQ_KEY")
+
     def __init__(self, name, desc, token, api_key, default_lists: bool = True, n: int=None): # board desc to be added
         super().__init__()
         # keyword extraction model
@@ -106,7 +108,7 @@ class TrelloIntegration:
 
     async def generate_list_names(summary: str, n: int = 3): # function to generate "n" lists for the users
         llm = ChatOpenAI(
-            api_key=os.getenv("GROQ_API_KEY"),
+            api_key=TrelloIntegration.groq_key,
             base_url="https://api.groq.com/openai/v1",
             model="llama-3.3-70b-versatile",
             temperature=0.1,
@@ -194,7 +196,7 @@ class TrelloIntegration:
             ])
 
             model = ChatOpenAI(
-                api_key=os.getenv("GROQ_API_KEY"),
+                api_key=TrelloIntegration.groq_key,
                 base_url="https://api.groq.com/openai/v1",
                 model="llama-3.3-70b-versatile",
                 temperature=0.1,
