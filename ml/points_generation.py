@@ -14,6 +14,8 @@ import asyncio
 import aiohttp
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+import json
 
 # nlp processing class
 class KeywordAndSentencesExtractor:
@@ -99,32 +101,34 @@ class TrelloIntegration:
                 print(f"following is the error message from trello : {response.text}")
             response.raise_for_status() # error if board creation failed
             self.board_response = response.json()
-            print(response.json())
             self.boardURL = self.board_response.get("url") # fetching the board url
-            print(response.text)
         except requests.exceptions.HTTPError as e:
             self.board_response = {"status_code": 400, "message": e}
             print(f"error encountered in board creation : {e}")
 
-    async def generate_list_names(summary: str, n: int = 3): # function to generate "n" lists for the users
+    def generate_list_names(self, summary: str, n: int): # function to generate "n" lists for the users
         llm = ChatOpenAI(
             api_key=TrelloIntegration.groq_key,
             base_url="https://api.groq.com/openai/v1",
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             temperature=0.1,
             max_tokens=128
         )
         promptTemplate = ChatPromptTemplate([
-            ("system", "You are a Trello workflow automation agent and you are to produce {n} list names for a particular summary."),
-            ("user", "Given this context {context} you are to generate the names for the lists that can be created on the trello board for the user, basically dividing the entire task into the required number of list names. Output only the list of the list names and no explanation for the same")
-        ])
-
-        promptTemplate.invoke({"n": n, "context": summary})
+                ("system", "You are a Trello workflow automation agent. Always respond ONLY with a valid JSON array of {n} list names. No explanations, no other text."),
+                ("user", "Given this context {context}, return the Trello list names as a JSON array of strings.")
+            ])
+        chain = promptTemplate | llm | StrOutputParser()
         try:
-            response = await llm.invoke(promptTemplate)
-        except Exception:
-            return None
-        return response.content
+            response = chain.invoke({"n": n, "context": summary})
+            print(f"this is the llm response content {response}")
+            try:
+                names = json.loads(response)
+            except Exception as e:
+                names = [line.strip("-• ") for line in response.splitlines() if line.strip()]
+            return names
+        except Exception as e:
+            return [e]
 
     @property
     def _get_board_url(self):
@@ -145,6 +149,8 @@ class TrelloIntegration:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, params=query, headers=headers) as response:
                 response.raise_for_status()
+                raw = await response.text()
+                return raw
 
     async def _add_cards_to_list(self, keywords: list):
         board_id = self.board_response.get("id")
@@ -153,22 +159,38 @@ class TrelloIntegration:
         if self.n and not self.default_lists:
             # Creating the lists in the board
             url_list = "https://api.trello.com/1/lists"
-            names = await self.generate_list_names(self.board_desc, self.n) # supposed to be in the list format
+            names = self.generate_list_names(self.board_desc, self.n) # supposed to be in the list format
+            print(names)
             query = {
                 "name": '{name}',
                 "idBoard": board_id,
                 "key": self.api_key,
                 "token": self.token
             }
+
+            semaphore = asyncio.Semaphore(3)
+
             async def add_lists(session, name):
-                payload = query["name"].format(name=name)
-                query["name"] = payload
-                async with session.get(url = url_list, params=query) as response:
-                    response.raise_for_status()
-                    return response.text
+                payload = query.copy()
+                payload["name"] = name
+                async with semaphore:
+                    async with session.post(url = url_list, params=payload) as response:
+                        response.raise_for_status()
+                        return response.text
+            list_addition_flag = False
             async with aiohttp.ClientSession() as session:
-                list_processing_coroutines = [add_lists(session, names[i]) for i in range(len(names))]
-                _ = await asyncio.gather(*list_processing_coroutines) # text messages from the list creation request
+                for attempt in range(5):
+                    list_processing_coroutines = [add_lists(session, name) for name in names]
+                    try:
+                        sample = await asyncio.gather(*list_processing_coroutines) # text messages from the list creation request
+                        list_addition_flag = True
+                        break
+                    except aiohttp.ClientResponseError as e:
+                        if e.status == 429:
+                            print(f"Rate limit error retrying for the {attempt+1} time")
+                            await asyncio.sleep(2*attempt)
+                if not list_addition_flag:
+                    raise Exception("Maximum retries exhausted the list cannot be created")
 
         url = self.url + f"{board_id}/lists"
         headers = {
@@ -185,34 +207,48 @@ class TrelloIntegration:
         print(list_names)
 
         async def keyword_classifier(): # zero-shot classification for the keywords
-
             '''
             Code segment for improving the keywords of the keybert model using langchain
             '''
             prompt_template_key = ChatPromptTemplate([
-                ("system", "You are a trello card creator and you are to improve the currently existing card text."),
-                ('user', 'Given this context {context} and these cards values : {cards} you are to improve the current card values such that the card values are more contextually correct and to the point that are able to explain the particular task that they are meant to explain.\
-                 The output should be in a strict list format and no other information should be there along with it.')
-            ])
-
+                    (
+                        "system",
+                        "You are a Trello card creator. "
+                        "Your task is to improve the given card texts. "
+                        "Output must be STRICTLY valid JSON that can be parsed with json.loads in Python. "
+                        "The JSON must be a list of strings, where each string is an improved card value. "
+                        "Do NOT include explanations, keys, markdown, or any text other than the JSON list."
+                    ),
+                    (
+                        "user",
+                        "Context: {context} Cards: {cards} Return ONLY the JSON list of improved card values."
+                    )
+                ])
             model = ChatOpenAI(
                 api_key=TrelloIntegration.groq_key,
                 base_url="https://api.groq.com/openai/v1",
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 temperature=0.1,
                 max_tokens=128
             )
+
+            chain = prompt_template_key | model | StrOutputParser()
             try:
-                list_names = await model.invoke(prompt_template_key)
+                raw = await chain.ainvoke({"context":self.board_desc, "cards":keywords})
+                try:
+                    card_names = json.loads(raw)
+                except Exception as e:
+                    card_names = [line.strip("-• ") for line in raw.splitlines() if line.strip()]
             except Exception:
-                list_names = None
+                card_names = None
+            print(f"These are the new card names to be classified : {card_names}")
             '''
             classification using the zero shot learning model.
             '''
             list_key_mapping = defaultdict(list)
             try:
                 if list_names:
-                    for key in keywords:
+                    for key in card_names:
                         label = self.zero_shot_classifier(key, list_names)
                         list_key_mapping[label["labels"][0]].append(key)
                 return list_key_mapping
@@ -224,17 +260,12 @@ class TrelloIntegration:
         listKeyMap = await keyword_classifier()
         # {"todo": ["card1", "card2"]} --> desired output from the function
         
-        try: # threading for adding the cards to the lists simultaneously
-
-            # Can be made more efficient as per gemini
-            # right now the entire thread pool is destroyed and made again for different iterations -> inefficient
-            # every processing can be done by creating a seperate thread for all -> more efficient
-            # most efficient -> asyncio
+        try:
             tasks = []
             for list_name, list_id in list_id_map.items():
                 for card in listKeyMap[list_name]:
                     tasks.append(self.list_processing(list_id, card))
-                _ = asyncio.gather(*tasks)
+            sample = await asyncio.gather(*tasks)
             print("Adding cards to the lists successful")
         except Exception as e:
             print(f"Error occured in adding the cards to the lists! : {e}")
