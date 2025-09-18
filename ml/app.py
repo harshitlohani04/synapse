@@ -1,4 +1,4 @@
-# installing dependencies
+# importing dependencies
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -16,12 +16,6 @@ TRANSCRIPTS_PATH = "transcripts"
 
 # whisper model initialization
 model_w = whisper.load_model("base")
-
-# modal image
-# image = (modal.Image.debian_slim(python_version="3.11")
-#         .apt_install("ffmpeg")
-#         .pip_install_from_requirements("../requirements.txt")
-#         )
 
 # uploading the transcriptions from local to s3
 def file_upload(impPoints: str, link: str):
@@ -82,8 +76,8 @@ async def upload_video(request: Request):
     desc = extractor.text_extraction()
     keywords = extractor.keyword_extraction()
     # trello class init
-    trello = TrelloIntegration(name=boardName, desc=desc, token=trello_token, api_key=trello_key)
-    trello._add_cards_to_list(keywords)
+    trello = TrelloIntegration(name=boardName, desc=desc, token=trello_token, api_key=trello_key, default_lists=False, n=3)
+    await trello._add_cards_to_list(keywords) # naming is not the encouraged way
     board_url = trello._get_board_url
 
     return JSONResponse(content={"url for the board": board_url}, status_code=200)
