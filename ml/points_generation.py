@@ -106,7 +106,7 @@ class TrelloIntegration:
             self.board_response = {"status_code": 400, "message": e}
             print(f"error encountered in board creation : {e}")
 
-    def generate_list_names(self, summary: str, n: int): # function to generate "n" lists for the users
+    def generate_list_names(self, summary: str, n: int, user_context: str): # function to generate "n" lists for the users
         llm = ChatOpenAI(
             api_key=TrelloIntegration.groq_key,
             base_url="https://api.groq.com/openai/v1",
@@ -115,12 +115,14 @@ class TrelloIntegration:
             max_tokens=128
         )
         promptTemplate = ChatPromptTemplate([
-                ("system", "You are a Trello workflow automation agent. Always respond ONLY with a valid JSON array of {n} list names. No explanations, no other text."),
-                ("user", "Given this context {context}, return the Trello list names as a JSON array of strings.")
+                ("system", "You are a Trello workflow automation agent. Always respond ONLY with a valid JSON array of {n}"
+                " list names. No explanations, no other text."),
+                ("user", "Given this context {context} and to build a {user_context}, return the Trello list names as a "
+                "JSON array of strings.")
             ])
         chain = promptTemplate | llm | StrOutputParser()
         try:
-            response = chain.invoke({"n": n, "context": summary})
+            response = chain.invoke({"n": n, "context": summary, "user_context": user_context})
             print(f"this is the llm response content {response}")
             try:
                 names = json.loads(response)
@@ -152,14 +154,54 @@ class TrelloIntegration:
                 raw = await response.text()
                 return raw
 
-    async def _add_cards_to_list(self, keywords: list):
+    @staticmethod   
+    async def improve_user_context(user_context):
+        '''
+        The main purpose of this function is to remove the vagueness and add more relatable context to the user context.
+        groq/compound
+        '''
+        prompt_template = ChatPromptTemplate([
+            ("system", "You are a context improver for a planning assistant."
+                "Your task is to take the user's short or vague request and rewrite it into a clear, descriptive, and structured context."
+                "Do not change the meaning of the request.Do not add irrelevant details."
+                "Output must be STRICTLY valid JSON that can be parsed with json.loads in Python."
+                "The JSON must be a string, which represents the improvised user context."
+                "Do NOT include explanations, keys, markdown, or any text other than the JSON string."
+            ),
+            ("user", "Original user request: {user_context}" 
+                "Rewrite this into a clearer and more detailed context that can guide a task planner."
+            )
+        ])
+
+        model = ChatOpenAI(
+                api_key=TrelloIntegration.groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                model="groq/compound",
+                temperature=0.1,
+                max_tokens=128
+            )
+
+        chain = prompt_template | model | StrOutputParser()
+        try:
+            response = await chain.ainvoke({"user_context": user_context})
+            try:
+                new_context = json.loads(response)
+            except json.JSONDecodeError:
+                new_context = user_context
+        except Exception as e:
+            new_context = user_context
+        
+        return new_context
+
+    async def _add_cards_to_list(self, keywords: list, user_context: str):
         board_id = self.board_response.get("id")
+        user_context = await TrelloIntegration.improve_user_context(user_context)
 
         # if the user selects the option for custom lists
         if self.n and not self.default_lists:
             # Creating the lists in the board
             url_list = "https://api.trello.com/1/lists"
-            names = self.generate_list_names(self.board_desc, self.n) # supposed to be in the list format
+            names = self.generate_list_names(self.board_desc, self.n, user_context) # supposed to be in the list format
             print(names)
             query = {
                 "name": '{name}',
@@ -214,14 +256,17 @@ class TrelloIntegration:
                     (
                         "system",
                         "You are a Trello card creator. "
-                        "Your task is to improve the given card texts. "
+                        "Your task is to filter and improve the given card texts. "
+                        "Only keep cards that are DIRECTLY relevant to the user's context : {user_context} "
+                        "Completely ignore and drop unrelated cards. "
                         "Output must be STRICTLY valid JSON that can be parsed with json.loads in Python. "
                         "The JSON must be a list of strings, where each string is an improved card value. "
                         "Do NOT include explanations, keys, markdown, or any text other than the JSON list."
                     ),
                     (
                         "user",
-                        "Context: {context} Cards: {cards} Return ONLY the JSON list of improved card values."
+                        "Context: {context} Cards: {cards}"
+                        "Return ONLY the JSON list of improved card values."
                     )
                 ])
             model = ChatOpenAI(
@@ -234,7 +279,7 @@ class TrelloIntegration:
 
             chain = prompt_template_key | model | StrOutputParser()
             try:
-                raw = await chain.ainvoke({"context":self.board_desc, "cards":keywords})
+                raw = await chain.ainvoke({"context":self.board_desc, "cards":keywords, "user_context": user_context})
                 try:
                     card_names = json.loads(raw)
                 except Exception as e:
