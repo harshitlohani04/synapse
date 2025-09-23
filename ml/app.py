@@ -67,6 +67,7 @@ async def upload_video(request: Request):
     data = await request.json()
     video_link = data.get("video-link")
     boardName = data.get('board-name')
+    user_context = data.get("user-context")
     print(video_link)
     audio_path = download_video(video_link)
     print(f"{audio_path}")
@@ -77,7 +78,7 @@ async def upload_video(request: Request):
     keywords = extractor.keyword_extraction()
     # trello class init
     trello = TrelloIntegration(name=boardName, desc=desc, token=trello_token, api_key=trello_key, default_lists=False, n=3)
-    await trello._add_cards_to_list(keywords) # naming is not the encouraged way
+    await trello._add_cards_to_list(keywords, user_context) # naming is not the encouraged way
     board_url = trello._get_board_url
 
     return JSONResponse(content={"url for the board": board_url}, status_code=200)
