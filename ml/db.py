@@ -1,9 +1,10 @@
-### This is the DB creation file ###
+### THIS IS THE DB CREATION FILE ###
 
 from dotenv import load_dotenv
 import os
 from typing import List
 from pydantic import BaseModel
+from uuid import UUID
 
 # for sql database
 from sqlalchemy import create_engine, Column, Integer, String
@@ -17,6 +18,7 @@ load_dotenv()
 masterPass = os.getenv("MASTER_PASS_DB")
 urlRelational = f"postgresql://trello_app_dbs:{masterPass}@database-1.cxaiiq2u0r8b.ap-south-1.rds.amazonaws.com/database-1"
 
+# dynamodb client
 dynamodb = boto3.resource(
     "dynamodb",
     region_name = "ap-south-1",
@@ -33,6 +35,8 @@ class Users(Base):
     user_id = Column(Integer, primary_key=True)
     username = Column(String(100), nullable = False)
     password = Column(String(100), nullable=False)
+
+# CLASS FOR RELATIONAL DATA
 
 # class defining the data format for the data from celery worker
 class Data(BaseModel):
@@ -69,8 +73,42 @@ class CeleryTaskDB:
             )
             return True
         except Exception as e:
-            print(f"Encountered issue in pushing data to db: {e}")
+            print(f"Encountered issue in pushing data to celery task information db: {e}")
             return None
+
+class ProcessedAudioData(BaseModel):
+    userId: str
+    videoLink: str
+    audioId: UUID
+    transcriptions: str
+
+class VideoDB:
+    def __init__(self):
+        self.videoData = dynamodb.create_table(
+            TableName = "video-data",
+            KeySchema=[
+                {"AttributeName":"user_id", "KeyType": "HASH"}
+            ],
+            AttributeDefinitions = [
+                {"AttributeName": "user_id", "AttributeType": "S"}
+            ],
+            ProvisionThroughtput={"ReadCapacityUnits":5, "WriteCapacityUnits": 5}
+        )
+
+    def flagPushDatainDB(self, processedAudioData: ProcessedAudioData):
+        try:
+            self.videoData.push_item(
+                Item={
+                    "user_id": processedAudioData.userId,
+                    "videoLink": processedAudioData.videoLink,
+                    "audioId": processedAudioData.audioId,
+                    "transcriptions": processedAudioData.transcriptions
+                }
+            )
+            return True
+        except Exception as e:
+            print(f"Encountered issue in pushing the data into the processed video DB: {e}")
+
 
 
 
